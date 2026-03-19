@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { initializeApp } from "firebase/app";
-import { getFirestore, doc, setDoc, onSnapshot, updateDoc, arrayUnion, increment, getDoc } from "firebase/firestore";
+import { getFirestore, doc, setDoc, onSnapshot, updateDoc, arrayUnion, increment, getDoc, runTransaction } from "firebase/firestore";
 import { getAuth, signInAnonymously } from "firebase/auth";
 import { 
   Clock, Target, RotateCcw, Crown, Snowflake, Trash2, Plus, 
@@ -9,15 +9,17 @@ import {
 } from 'lucide-react';
 
 // ==========================================
-// 1. FIREBASE CONFIGURATION (YOUR KEYS)
+// 1. FIREBASE CONFIGURATION
 // ==========================================
+// Credentials are loaded from environment variables.
+// Copy .env.example to .env.local and fill in your project values.
 const firebaseConfig = {
-  apiKey: "AIzaSyA-DcusIs9re3bVCyw5rukGmnab-mHuIdw",
-  authDomain: "christmas-gamezone.firebaseapp.com",
-  projectId: "christmas-gamezone",
-  storageBucket: "christmas-gamezone.firebasestorage.app",
-  messagingSenderId: "432539594328",
-  appId: "1:432539594328:web:23d6378115f105e434642d"
+  apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
+  authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN,
+  projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID,
+  storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET,
+  messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID,
+  appId: import.meta.env.VITE_FIREBASE_APP_ID,
 };
 
 const app = initializeApp(firebaseConfig);
@@ -145,6 +147,14 @@ const playShootSound = () => {
   }
 };
 
+// Cryptographically secure room code — avoids visually ambiguous chars (0/O, 1/I/l)
+const ROOM_CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+const generateRoomCode = () => {
+  const arr = new Uint8Array(4);
+  crypto.getRandomValues(arr);
+  return Array.from(arr).map(b => ROOM_CODE_CHARS[b % ROOM_CODE_CHARS.length]).join('');
+};
+
 // ==========================================
 // 4. MAIN APP COMPONENT
 // ==========================================
@@ -162,36 +172,50 @@ export default function App() {
   }, []);
 
   const createRoom = async () => {
-    const code = Math.random().toString(36).substring(2, 6).toUpperCase();
-    await setDoc(doc(db, "rooms", code), {
-      hostId: user.uid,
-      page: 'intro',
-      kids: INITIAL_KIDS, 
-      timer: 10, // REQ 2: Mad Rush (10 seconds)
-      level: 0,
-      hits: 0,
-      shotsFired: 0,
-      startTime: Date.now(),
-      totalWins: 0,
-      players: [user.uid],
-      lastUpdate: Date.now()
-    });
-    setRoomCode(code);
-    setHostId(user.uid);
-    setIsInGame(true);
+    try {
+      const code = generateRoomCode();
+      await setDoc(doc(db, "rooms", code), {
+        hostId: user.uid,
+        page: 'intro',
+        kids: INITIAL_KIDS,
+        timer: 10, // REQ 2: Mad Rush (10 seconds)
+        level: 0,
+        hits: 0,
+        shotsFired: 0,
+        startTime: Date.now(),
+        totalWins: 0,
+        players: [user.uid],
+        lastUpdate: Date.now()
+      });
+      setRoomCode(code);
+      setHostId(user.uid);
+      setIsInGame(true);
+    } catch (e) {
+      console.error("Failed to create room:", e);
+      alert("Failed to create room. Please check your connection and try again.");
+    }
   };
 
   const joinRoom = async (codeInput) => {
-    const code = codeInput.toUpperCase();
-    const ref = doc(db, "rooms", code);
-    const snap = await getDoc(ref);
-    if (snap.exists()) {
-      setRoomCode(code);
-      setHostId(snap.data().hostId);
-      await updateDoc(ref, { players: arrayUnion(user.uid) });
-      setIsInGame(true);
-    } else {
-      alert("Room not found!");
+    const code = codeInput.trim().toUpperCase();
+    if (!/^[A-Z0-9]{4}$/.test(code)) {
+      alert("Please enter a valid 4-character room code.");
+      return;
+    }
+    try {
+      const ref = doc(db, "rooms", code);
+      const snap = await getDoc(ref);
+      if (snap.exists()) {
+        setRoomCode(code);
+        setHostId(snap.data().hostId);
+        await updateDoc(ref, { players: arrayUnion(user.uid) });
+        setIsInGame(true);
+      } else {
+        alert("Room not found!");
+      }
+    } catch (e) {
+      console.error("Failed to join room:", e);
+      alert("Failed to join room. Please check your connection and try again.");
     }
   };
 
@@ -217,8 +241,18 @@ export default function App() {
 function Lobby({ onCreate, onJoin }) {
   const [code, setCode] = useState('');
   const [stats] = useState(() => {
-    const saved = localStorage.getItem('xmas-game-stats');
-    return saved ? JSON.parse(saved) : { totalWins: 0, bestScore: 0 };
+    try {
+      const saved = localStorage.getItem('xmas-game-stats');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (parsed && typeof parsed.totalWins === 'number' && typeof parsed.bestScore === 'number') {
+          return parsed;
+        }
+      }
+    } catch (e) {
+      // Ignore malformed data and fall back to defaults
+    }
+    return { totalWins: 0, bestScore: 0 };
   });
 
   const currentRank = RANKS.slice().reverse().find(r => stats.totalWins >= r.level) || RANKS[0];
@@ -247,7 +281,7 @@ function Lobby({ onCreate, onJoin }) {
         <div className="relative border-t border-gray-200 pt-6">
           <p className="text-sm text-gray-400 mb-4 uppercase tracking-widest font-bold">Or Join Squad</p>
           <div className="flex gap-2">
-            <input value={code} onChange={(e) => setCode(e.target.value)} placeholder="Room Code" className="flex-1 bg-gray-100 border-2 focus:border-green-500 rounded-xl px-4 text-center font-mono text-xl uppercase" />
+            <input value={code} onChange={(e) => setCode(e.target.value)} placeholder="Room Code" maxLength={4} className="flex-1 bg-gray-100 border-2 focus:border-green-500 rounded-xl px-4 text-center font-mono text-xl uppercase" />
             <button onClick={() => onJoin(code)} className="px-6 bg-green-600 hover:bg-green-700 text-white rounded-xl font-bold shadow-lg">JOIN</button>
           </div>
         </div>
@@ -262,7 +296,11 @@ function GameRoom({ user, roomCode, isHost, myIdentity, setMyIdentity }) {
 
   // Sync with Firestore
   useEffect(() => {
-    return onSnapshot(doc(db, "rooms", roomCode), (doc) => doc.exists() && setGameState(doc.data()));
+    return onSnapshot(
+      doc(db, "rooms", roomCode),
+      (snapshot) => snapshot.exists() && setGameState(snapshot.data()),
+      (error) => console.error("Firestore sync error:", error)
+    );
   }, [roomCode]);
 
   // Host Logic Loop
@@ -284,12 +322,31 @@ function GameRoom({ user, roomCode, isHost, myIdentity, setMyIdentity }) {
         <h1 className="text-3xl font-black mb-8 text-yellow-400">Who Are You?</h1>
         <div className="grid grid-cols-1 gap-4 w-full max-w-md">
           {gameState.kids.map(kid => (
-            <button key={kid.id} 
+            <button key={kid.id}
               disabled={kid.claimedBy && kid.claimedBy !== user.uid}
-              onClick={() => {
-                const newKids = gameState.kids.map(k => k.id === kid.id ? { ...k, claimedBy: user.uid } : k);
-                updateDoc(doc(db, "rooms", roomCode), { kids: newKids });
-                setMyIdentity(kid.id);
+              onClick={async () => {
+                try {
+                  const roomRef = doc(db, "rooms", roomCode);
+                  await runTransaction(db, async (transaction) => {
+                    const roomDoc = await transaction.get(roomRef);
+                    if (!roomDoc.exists()) throw new Error("Room not found");
+                    const kids = roomDoc.data().kids;
+                    const target = kids.find(k => k.id === kid.id);
+                    if (target?.claimedBy && target.claimedBy !== user.uid) {
+                      throw new Error("Already claimed");
+                    }
+                    const newKids = kids.map(k => k.id === kid.id ? { ...k, claimedBy: user.uid } : k);
+                    transaction.update(roomRef, { kids: newKids });
+                  });
+                  setMyIdentity(kid.id);
+                } catch (e) {
+                  if (e.message === "Already claimed") {
+                    alert("This character was just claimed by another player!");
+                  } else {
+                    console.error("Failed to claim identity:", e);
+                    alert("Failed to claim identity. Please try again.");
+                  }
+                }
               }}
               className={`p-6 rounded-xl font-bold text-xl flex justify-between items-center ${kid.claimedBy ? 'bg-gray-700 opacity-50' : 'bg-green-600 hover:bg-green-500 shadow-lg'}`}
             >
@@ -411,13 +468,14 @@ function SetupScreen({ isHost, roomCode, kids }) {
             <div key={kid.id} className="bg-gray-50 p-4 rounded-2xl border border-gray-200 shadow-sm relative">
               {/* Agent Name Header */}
               <div className="flex gap-2 mb-4">
-                <input 
+                <input
                   disabled={!isHost}
                   value={kid.name}
+                  maxLength={30}
                   onChange={(e) => {
                     const newKids = [...kids];
                     newKids[idx].name = e.target.value;
-                    updateDoc(doc(db, "rooms", roomCode), { kids: newKids });
+                    updateDoc(doc(db, "rooms", roomCode), { kids: newKids }).catch(console.error);
                   }}
                   className="flex-1 bg-white p-3 rounded-xl font-bold text-xl border-2 border-gray-200 focus:border-blue-500 outline-none"
                   placeholder={`Agent ${idx+1}`}
@@ -435,8 +493,9 @@ function SetupScreen({ isHost, roomCode, kids }) {
                       className={`flex-1 p-2 rounded-lg flex items-center justify-between border-2 transition-all ${task.done ? 'bg-green-100 border-green-400' : 'bg-white border-gray-200'}`}
                     >
                       {isHost ? (
-                        <input 
+                        <input
                           value={task.task}
+                          maxLength={100}
                           onChange={(e) => editTaskName(kid.id, task.id, e.target.value)}
                           className="bg-transparent font-semibold text-gray-700 text-sm outline-none w-full"
                         />
@@ -622,17 +681,31 @@ function BossBattle({ gameState, roomCode, isHost, isMuted }) {
 
   const nextLevel = async () => {
     if (level < LEVELS.length - 1) {
-      await updateDoc(doc(db, "rooms", roomCode), { level: increment(1), hits: 0, page: 'story-afterBoss' });
+      await updateDoc(doc(db, "rooms", roomCode), { level: increment(1), hits: 0, page: 'story-afterBoss' }).catch(console.error);
     } else {
-      // Save stats
-      const saved = localStorage.getItem('xmas-game-stats');
-      const stats = saved ? JSON.parse(saved) : { totalWins: 0, bestScore: 0 };
-      const currentScore = gameState.kids.reduce((acc, k) => acc + (k.nice - k.naughty), 0);
-      stats.totalWins += 1;
-      if (currentScore > stats.bestScore) stats.bestScore = currentScore;
-      localStorage.setItem('xmas-game-stats', JSON.stringify(stats));
+      // Save stats safely
+      try {
+        let stats = { totalWins: 0, bestScore: 0 };
+        try {
+          const saved = localStorage.getItem('xmas-game-stats');
+          if (saved) {
+            const parsed = JSON.parse(saved);
+            if (parsed && typeof parsed.totalWins === 'number' && typeof parsed.bestScore === 'number') {
+              stats = parsed;
+            }
+          }
+        } catch (e) {
+          // Use default stats if storage is corrupt
+        }
+        const currentScore = gameState.kids.reduce((acc, k) => acc + (k.nice - k.naughty), 0);
+        stats.totalWins += 1;
+        if (currentScore > stats.bestScore) stats.bestScore = currentScore;
+        localStorage.setItem('xmas-game-stats', JSON.stringify(stats));
+      } catch (e) {
+        console.error("Failed to save stats:", e);
+      }
 
-      await updateDoc(doc(db, "rooms", roomCode), { totalWins: increment(1), page: 'victory' });
+      await updateDoc(doc(db, "rooms", roomCode), { totalWins: increment(1), page: 'victory' }).catch(console.error);
     }
   };
 
